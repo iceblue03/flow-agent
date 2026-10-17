@@ -17,7 +17,7 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .engine import EngineError, FlowEngine
 
@@ -75,7 +75,7 @@ class ImageGenerationRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     prompt: str
-    model: str = "narwhal"
+    model: str = "beluga"
     n: int = Field(default=1, ge=1, le=4)
     size: str = "1024x1024"
     response_format: str = "url"
@@ -83,14 +83,40 @@ class ImageGenerationRequest(BaseModel):
     all_accounts: bool = False
     cookies: Optional[str] = None
 
+    @field_validator("model", mode="before")
+    @classmethod
+    def sanitize_model(cls, v: Any) -> str:
+        # Fallback to BELUGA if empty or set to legacy/unsupported models or placeholders
+        val = str(v).strip().lower() if v else "beluga"
+        if val in ("narwhal", "string", "default", "none", "null", ""):
+            return "beluga"
+        return val
+
 
 class FlowImageRequest(BaseModel):
     prompt: str
     aspect: str = "1:1"
     count: int = Field(default=1, ge=1, le=4)
-    model: str = "narwhal"
+    model: str = "beluga"
     all_accounts: bool = False
     cookies: Optional[str] = None
+
+    @field_validator("model", mode="before")
+    @classmethod
+    def sanitize_model(cls, v: Any) -> str:
+        # Fallback to BELUGA if empty or set to legacy/unsupported models or placeholders
+        val = str(v).strip().lower() if v else "beluga"
+        if val in ("narwhal", "string", "default", "none", "null", ""):
+            return "beluga"
+        return val
+
+    @field_validator("cookies", mode="before")
+    @classmethod
+    def sanitize_cookies(cls, v: Any) -> Optional[str]:
+        # Filter out Swagger UI default placeholder ('string') and empty values
+        if not v or str(v).strip().lower() in ("string", "null", "none", "undefined", '""', "''"):
+            return None
+        return str(v).strip()
 
 
 class FlowVideoRequest(BaseModel):
@@ -102,6 +128,14 @@ class FlowVideoRequest(BaseModel):
     start_image: Optional[str] = None
     all_accounts: bool = False
     cookies: Optional[str] = None
+
+    @field_validator("cookies", mode="before")
+    @classmethod
+    def sanitize_cookies(cls, v: Any) -> Optional[str]:
+        # Filter out Swagger UI default placeholder ('string') and empty values
+        if not v or str(v).strip().lower() in ("string", "null", "none", "undefined", '""', "''"):
+            return None
+        return str(v).strip()
 
 
 class ChatMessage(BaseModel):

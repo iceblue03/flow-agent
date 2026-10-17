@@ -22,6 +22,14 @@ from typing import Any, Optional
 DEFAULT_TIMEOUT = 900
 
 
+def _is_valid_cookie_arg(val: Optional[str]) -> bool:
+    """Filter out dummy placeholders (e.g. 'string', 'null') and empty values sent by Swagger UI or clients."""
+    if not val:
+        return False
+    clean = str(val).strip()
+    return bool(clean and clean.lower() not in ("string", "null", "none", "undefined", '""', "''"))
+
+
 class EngineError(RuntimeError):
     """A Flow engine invocation that did not succeed.
 
@@ -112,15 +120,25 @@ class FlowEngine:
 
         import platform
         system = platform.system().lower()
+        machine = platform.machine().lower()
         bin_dir = root / "bin"
+
+        is_arm = machine in ("aarch64", "arm64", "armv8l", "armv8")
 
         # Platform priority candidates
         if "windows" in system:
             candidates = ["flow-windows.exe", "flow.exe", "flow"]
         elif "darwin" in system:
-            candidates = ["flow-macos", "flow", "flow-darwin"]
+            candidates = (
+                ["flow-macos-arm64", "flow-macos", "flow", "flow-darwin"]
+                if is_arm
+                else ["flow-macos", "flow", "flow-darwin"]
+            )
         else:  # Linux / Unix
-            candidates = ["flow-linux", "flow", "flow-x86_64"]
+            if is_arm:
+                candidates = ["flow-linux-arm64", "flow-arm64", "flow-linux", "flow"]
+            else:
+                candidates = ["flow-linux-amd64", "flow-linux", "flow", "flow-x86_64"]
 
         for name in candidates:
             candidate_path = bin_dir / name
@@ -218,7 +236,7 @@ class FlowEngine:
         prompt: str,
         aspect: str = "1:1",
         count: int = 1,
-        model: str = "narwhal",
+        model: str = "beluga",
         all_accounts: bool = False,
         cookies: Optional[str] = None,
         download: bool = True,
@@ -235,14 +253,17 @@ class FlowEngine:
         which happens with `download=False` and on a refusal alike, so a caller
         that needs the bytes should read it and not assume it.
         """
+        # Fallback to BELUGA if empty or set to legacy/unsupported models (e.g. narwhal) or dummy placeholders
+        effective_model = "beluga" if (not model or model.lower() in ("narwhal", "string", "default", "none", "null")) else model
+
         args: list[Any] = ["image", prompt, aspect]
         if count and count > 1:
             args.append(f"x{count}")
-        if model:
-            args += ["--model", model]
+        if effective_model:
+            args += ["--model", effective_model]
         if all_accounts:
             args.append("--all")
-        if cookies:
+        if _is_valid_cookie_arg(cookies):
             args += ["--cookies", cookies]
         if not download:
             args.append("--no-download")
@@ -275,7 +296,7 @@ class FlowEngine:
             args += ["--start-image", start_image]
         if all_accounts:
             args.append("--all")
-        if cookies:
+        if _is_valid_cookie_arg(cookies):
             args += ["--cookies", cookies]
         if not download:
             args.append("--no-download")
@@ -298,7 +319,7 @@ class FlowEngine:
         args: list[Any] = ["upload-video", file_path]
         if force:
             args.append("--force-upload")
-        if cookies:
+        if _is_valid_cookie_arg(cookies):
             args += ["--cookies", cookies]
 
         return await self._run_json(*args, timeout=timeout)
@@ -328,7 +349,7 @@ class FlowEngine:
         not an object wrapping one.
         """
         args: list[Any] = ["projects", "--json"]
-        if cookies:
+        if _is_valid_cookie_arg(cookies):
             args += ["--cookies", cookies]
         out, _ = await self._run(*args)
         try:
