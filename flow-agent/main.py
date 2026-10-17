@@ -100,6 +100,62 @@ def cmd_projects(args) -> int:
     return 0
 
 
+def cmd_key(args) -> int:
+    """API Key 생성, 목록 조회, 비활성화 및 삭제 서브커맨드 처리 핸들러."""
+    from flow_agent import create_api_key, delete_api_key, list_api_keys, mask_key, revoke_api_key
+
+    action = args.key_action
+    if action == "create":
+        entry = create_api_key(name=args.name)
+        print("=" * 68)
+        print("  🔑 새로운 Google Flow API Key가 성공적으로 생성되었습니다.")
+        print("=" * 68)
+        print(f"  - 별칭 (Name) : {entry['name']}")
+        print(f"  - API Key     : {entry['key']}")
+        print(f"  - 생성 일시   : {entry['created_at']}")
+        print("=" * 68)
+        print("  [주의] 생성된 키는 안전한 장소에 보관하십시오.")
+        print("  OpenAI SDK 사용 예시:")
+        print(f'    client = OpenAI(base_url="http://<호스트>:8001/v1", api_key="{entry["key"]}")')
+        print("=" * 68)
+        return 0
+
+    if action == "list":
+        keys = list_api_keys()
+        if not keys:
+            print("등록된 API Key가 없습니다. 'python main.py key create' 명령으로 새 키를 생성하세요.")
+            return 0
+        print(f"{'상태':<6} | {'별칭 (Name)':<20} | {'API Key':<24} | {'생성 일시'}")
+        print("-" * 75)
+        for k in keys:
+            status_str = "활성" if k.get("active", True) else "비활성"
+            print(
+                f"{status_str:<6} | {k.get('name', 'default'):<20} | "
+                f"{mask_key(k.get('key', '')):<24} | {k.get('created_at', '')}"
+            )
+        return 0
+
+    if action == "revoke":
+        target = args.target
+        success = revoke_api_key(target)
+        if success:
+            print(f"성공: API Key '{target}'가 비활성화되었습니다.")
+            return 0
+        print(f"오류: 대상 API Key 또는 별칭 '{target}'을 찾을 수 없습니다.", file=sys.stderr)
+        return 1
+
+    if action == "delete":
+        target = args.target
+        success = delete_api_key(target)
+        if success:
+            print(f"성공: API Key '{target}'가 영구 삭제되었습니다.")
+            return 0
+        print(f"오류: 대상 API Key 또는 별칭 '{target}'을 찾을 수 없습니다.", file=sys.stderr)
+        return 1
+
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # parser
 # --------------------------------------------------------------------------- #
@@ -196,7 +252,26 @@ def build_parser() -> argparse.ArgumentParser:
     projects.add_argument("--cookies", default=None)
     projects.set_defaults(func=cmd_projects)
 
+    key_parser = sub.add_parser("key", help="manage API keys for server authentication")
+    key_sub = key_parser.add_subparsers(dest="key_action", required=True)
+
+    key_create = key_sub.add_parser("create", help="generate a new API key")
+    key_create.add_argument("--name", default="default", help="name or alias for this key")
+    key_create.set_defaults(func=cmd_key)
+
+    key_list = key_sub.add_parser("list", help="list all registered API keys")
+    key_list.set_defaults(func=cmd_key)
+
+    key_revoke = key_sub.add_parser("revoke", help="deactivate an API key")
+    key_revoke.add_argument("target", help="API key string or name to deactivate")
+    key_revoke.set_defaults(func=cmd_key)
+
+    key_delete = key_sub.add_parser("delete", help="permanently delete an API key")
+    key_delete.add_argument("target", help="API key string or name to delete")
+    key_delete.set_defaults(func=cmd_key)
+
     return parser
+
 
 
 def main(argv=None) -> int:
