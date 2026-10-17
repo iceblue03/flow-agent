@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import json
+import mimetypes
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -87,10 +88,12 @@ class ImageGenerationRequest(BaseModel):
         description="이미지 해상도 (1024x1024, 1792x1024, 1024x1792 등)",
     )
     response_format: str = Field(
-        default="image",
+        default="url",
         description=(
-            "응답 형식: 'image' (Swagger UI 및 브라우저에서 즉시 미리보고 다운로드 가능한 이미지 파일 직접 반환), "
-            "'url' (OpenAI 표준 URL JSON), 'b64_json' (Base64 JSON)"
+            "Response format. 'url' is the OpenAI default and what an unmodified "
+            "SDK expects: JSON carrying a fetchable link. 'image' streams the raw "
+            "bytes back for inline preview or download in a browser; 'b64_json' "
+            "inlines the bytes in JSON."
         ),
     )
     # Flow 고유 설정 (OpenAI 클라이언트는 무시)
@@ -524,31 +527,36 @@ async def flow_projects(cookies: Optional[str] = None):
 @app.get("/v1/media/{filename:path}")
 @app.get("/api/v1/media/{filename:path}")
 async def flow_media(filename: str):
-    """생성된 미디어 파일을 안전하게 서빙하는 엔드포인트.
+    """Serve a generated media file, confined to a known output directory.
 
-    엔진의 다양한 출력 디렉터리 경로 후보를 순회하여 파일을 탐색하고 전송합니다.
-    디렉터리 탐색 공격(..)은 상위 디렉터리 경계 검사를 통해 차단합니다.
+    Candidates are tried in order and each must resolve *inside* the directory
+    it was found in. A string prefix is not that test: `/out` is a prefix of
+    `/out-evil`, so a sibling directory that merely shares a prefix would be
+    served. `Path.is_relative_to` compares path parts, so it cannot be fooled.
+
+    `engine.root` is read defensively. It is optional on the engine contract,
+    and a missing attribute must be a 404 here, not a 500.
+
+    The content type comes from `mimetypes` rather than a hand-kept extension
+    table, because the preview page exists to render images inline - serving a
+    PNG as `application/octet-stream` makes the browser download it instead.
     """
-    search_dirs = [
-        MEDIA_DIR,
-        engine.root / "output",
-        Path(__file__).resolve().parent.parent / "output",
-    ]
+    search_dirs: list[Path] = [MEDIA_DIR]
+    engine_root = getattr(engine, "root", None)
+    if engine_root is not None:
+        search_dirs.append(Path(engine_root) / "output")
+    search_dirs.append(Path(__file__).resolve().parent.parent / "output")
+
     for sdir in search_dirs:
+        base = Path(sdir).resolve()
         try:
-            cand = (sdir / filename).resolve()
-            if cand.is_file() and str(cand).startswith(str(sdir.resolve())):
-                ext = cand.suffix.lower()
-                media_type = (
-                    "image/jpeg"
-                    if ext in (".jpg", ".jpeg")
-                    else "video/mp4"
-                    if ext == ".mp4"
-                    else "application/octet-stream"
-                )
-                return FileResponse(cand, media_type=media_type, filename=cand.name)
-        except Exception:
+            cand = (base / filename).resolve()
+        except (OSError, ValueError):
             continue
+        if not cand.is_file() or not cand.is_relative_to(base):
+            continue
+        media_type = mimetypes.guess_type(cand.name)[0] or "application/octet-stream"
+        return FileResponse(cand, media_type=media_type, filename=cand.name)
     raise HTTPException(status_code=404, detail="no such media file")
 
 

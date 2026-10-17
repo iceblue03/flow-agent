@@ -368,6 +368,32 @@ def test_media_serves_a_real_file(client):
     assert v1_response.content == b"png-bytes"
 
 
+def test_media_serves_a_png_as_a_png(client):
+    """The preview page renders these inline, so the type has to be right.
+
+    `application/octet-stream` makes the browser download the file instead,
+    which is the one thing the preview page exists to avoid.
+    """
+    (client.media_dir / "ok.png").write_bytes(b"png-bytes")
+    response = client.get("/api/v1/media/ok.png")
+    assert response.headers["content-type"] == "image/png"
+
+
+def test_media_refuses_a_sibling_directory_sharing_a_prefix(client):
+    """A prefix is not containment: `/out` starts `/out-evil`.
+
+    Encoded on purpose - a literal `..` may be collapsed by the HTTP client
+    before the request reaches the route, which would make this pass for the
+    wrong reason.
+    """
+    sibling = client.media_dir.parent / f"{client.media_dir.name}-evil"
+    sibling.mkdir()
+    (sibling / "leak.txt").write_text("do not serve me")
+
+    name = f"%2e%2e%2f{client.media_dir.name}-evil%2fleak.txt"
+    assert client.get(f"/api/v1/media/{name}").status_code == 404
+
+
 def test_media_refuses_a_traversal(client):
     """The route takes a name out of a URL, and `..` in one is the whole attack."""
     secret = client.media_dir.parent / "secret.txt"
