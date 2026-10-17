@@ -142,6 +142,72 @@ def test_openai_images_returns_a_fetchable_url(client):
     assert body["flow"]["job_id"] == "j1"
 
 
+def test_openai_images_requires_a_prompt(client):
+    """A missing prompt is refused rather than filled in.
+
+    `prompt` is the one field OpenAI marks required, and every generation here
+    spends a credit: a server-side default would charge an account for a
+    sentence the caller never wrote and hand back an image nobody asked for.
+    """
+    response = client.post("/v1/images/generations", json={})
+    assert response.status_code == 422
+    # Refused at the schema, so the engine is never reached and nothing is spent.
+    assert client.fake.calls == []
+
+
+def test_openai_images_uses_a_forwarded_proxy_authority(client):
+    """Honouring the forwarded pair is the point - a proxy rewrites it."""
+    body = client.post(
+        "/v1/images/generations",
+        json={"prompt": "x"},
+        headers={"x-forwarded-host": "proxy.example:8443", "x-forwarded-proto": "https"},
+    ).json()
+    assert body["data"][0]["url"] == "https://proxy.example:8443/api/v1/media/one.png"
+
+
+def test_openai_images_keeps_the_request_scheme_for_a_bogus_forwarded_proto(client):
+    """The scheme and the host fall back independently.
+
+    A proxy that forwards the host but not the scheme must still get its host
+    used, and a scheme that is not http(s) must not be able to reach the URL.
+    """
+    body = client.post(
+        "/v1/images/generations",
+        json={"prompt": "x"},
+        headers={"x-forwarded-host": "proxy.example", "x-forwarded-proto": "javascript:"},
+    ).json()
+    assert body["data"][0]["url"] == "http://proxy.example/api/v1/media/one.png"
+
+
+@pytest.mark.parametrize(
+    "forwarded_host",
+    [
+        "evil.example/steal",  # a path leaves the authority position
+        "evil.example?x=1",  # so does a query
+        "evil.example#f",  # and a fragment
+        "user@evil.example",  # read as credentials, not as a host
+        "good\\evil.example",  # a browser normalises the backslash to a slash
+        "evil%2f.example",  # percent-encoded, and not decoded here
+        "[::1",  # an unclosed IPv6 bracket is not a URL
+        "",  # absent
+    ],
+)
+def test_openai_images_ignores_a_forwarded_host_that_is_not_an_authority(
+    client, forwarded_host
+):
+    """The header is caller input and the URL it builds lands in a response.
+
+    A value that is not a bare `host[:port]` is not an error - the request's own
+    host is used instead, so the link a client is handed still points here.
+    """
+    body = client.post(
+        "/v1/images/generations",
+        json={"prompt": "x"},
+        headers={"x-forwarded-host": forwarded_host},
+    ).json()
+    assert body["data"][0]["url"] == "http://testserver/api/v1/media/one.png"
+
+
 def test_openai_images_refuses_an_unknown_size(client):
     response = client.post(
         "/v1/images/generations", json={"prompt": "x", "size": "640x480"}

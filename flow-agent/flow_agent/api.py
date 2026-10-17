@@ -14,6 +14,7 @@ import mimetypes
 import time
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,9 +40,11 @@ app.add_middleware(
 engine = FlowEngine()
 
 
-# OpenAI 규격 이미지 크기와 Google Flow 종횡비 매핑 테이블.
-#
-# OpenAI DALL-E 표준 해상도와 Flow 네이티브 비율(1:1, 16:9, 9:16 등)을 상호 변환합니다.
+# OpenAI's image sizes, and the aspect each one means.
+# The pairs are not invented here: OpenAI's three sizes are 1:1, 3:2 and 2:3, and
+# the Flow ratios that match are square, landscape and portrait. The two extra
+# entries are Flow's own 4:3 and 3:4, which have no OpenAI size and are reachable
+# through the native route.
 SIZE_TO_ASPECT = {
     "1024x1024": "1:1",
     "1792x1024": "16:9",
@@ -50,7 +53,7 @@ SIZE_TO_ASPECT = {
     "1024x1365": "3:4",
     "512x512": "1:1",
     "256x256": "1:1",
-    # 텍스트 형태의 별칭 지원
+    # The aliases a caller may use instead of pixels.
     "square": "1:1",
     "landscape": "16:9",
     "portrait": "9:16",
@@ -65,28 +68,19 @@ MEDIA_DIR = engine.output_dir
 
 
 class ImageGenerationRequest(BaseModel):
-    """OpenAI 호환 이미지 생성 요청 모델.
+    """The OpenAI images payload, plus the two Flow extras.
 
-    OpenAI 공식 규격(prompt, model, n, size, response_format)을 충족하며,
-    Swagger UI 미리보기 및 외부 클라이언트의 즉각적인 파일 수신을 위해
-    'image' 포맷(바이너리 스트림 직접 반환)을 함께 지원합니다.
+    Extra fields are allowed rather than rejected: an OpenAI client sends keys
+    this does not model, and failing the request over a field nobody needs would
+    make the endpoint unusable from the SDKs it exists to serve.
     """
 
     model_config = ConfigDict(extra="allow")
 
-    prompt: str = Field(
-        default="a glowing crystal lotus on calm water",
-        description="이미지 생성을 위한 텍스트 프롬프트",
-    )
-    model: str = Field(
-        default="beluga",
-        description="Flow 이미지 생성 모델 (기본값: 'beluga')",
-    )
-    n: int = Field(default=1, ge=1, le=4, description="생성할 이미지 개수 (1-4)")
-    size: str = Field(
-        default="1024x1024",
-        description="이미지 해상도 (1024x1024, 1792x1024, 1024x1792 등)",
-    )
+    prompt: str
+    model: str = "beluga"
+    n: int = Field(default=1, ge=1, le=4)
+    size: str = "1024x1024"
     response_format: str = Field(
         default="url",
         description=(
@@ -96,26 +90,18 @@ class ImageGenerationRequest(BaseModel):
             "inlines the bytes in JSON."
         ),
     )
-    # Flow 고유 설정 (OpenAI 클라이언트는 무시)
+    # Flow-specific, ignored by OpenAI clients.
     all_accounts: bool = False
-    cookies: Optional[str] = Field(default=None, description="인증 세션 쿠키 (선택 사항)")
+    cookies: Optional[str] = None
 
     @field_validator("model", mode="before")
     @classmethod
     def sanitize_model(cls, v: Any) -> str:
-        # 빈 문자열 또는 Swagger UI 기본값('string') 입력 시 beluga로 대체
+        # Fallback to BELUGA if empty or set to legacy/unsupported models or placeholders
         val = str(v).strip().lower() if v else "beluga"
         if val in ("narwhal", "string", "default", "none", "null", ""):
             return "beluga"
         return val
-
-    @field_validator("cookies", mode="before")
-    @classmethod
-    def sanitize_cookies(cls, v: Any) -> Optional[str]:
-        # Swagger UI의 기본 입력값('string') 및 더미 값 필터링
-        if not v or str(v).strip().lower() in ("string", "null", "none", "undefined", '""', "''"):
-            return None
-        return str(v).strip()
 
 
 class FlowImageRequest(BaseModel):
@@ -187,16 +173,58 @@ class ChatCompletionRequest(BaseModel):
 # --------------------------------------------------------------------------- #
 
 
-def _media_url(request: Request, path: str) -> str:
-    """클라이언트가 생성된 미디어 파일을 직접 다운로드할 수 있는 완전한 절대 HTTP URL을 반환합니다.
+#: The characters a `host[:port]` may be built from: a DNS name, an IPv4 literal,
+#: a bracketed IPv6 literal, or an underscore in an internal hostname. `@`, `\`
+#: and `%` are absent on purpose - a userinfo `@` makes the host read as a
+#: credential, and a browser normalises `\` to `/`.
+_AUTHORITY_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:[]_"
+)
 
-    로컬호스트뿐만 아니라 외부 LAN IP 및 리버스 프록시 헤더(X-Forwarded-Proto, X-Forwarded-Host)를
-    모두 고려하여 외부 클라이언트가 즉시 접속 가능한 주소를 조합합니다.
+
+def _base_url(request: Request) -> str:
+    """The scheme and authority to build a URL for this request from.
+
+    Taken from the request's own base URL rather than a hardcoded host, so the
+    answer is right whether this is reached on localhost, a LAN address or behind
+    a proxy. `X-Forwarded-Proto` and `X-Forwarded-Host` are what a reverse proxy
+    rewrites, so they are honoured - but they are also caller-supplied strings on
+    their way into a response body, and a URL in a response is followed by
+    whoever asked for it. A forwarded pair is therefore used only when it
+    assembles into a bare `scheme://host[:port]`: no path, no query, no
+    credentials. Anything else falls back to this framework's own base URL.
     """
-    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
-    base = f"{proto}://{host}".rstrip("/")
-    return f"{base}/api/v1/media/{Path(path).name}"
+    proto = request.headers.get("x-forwarded-proto", "").strip().lower()
+    if proto not in ("http", "https"):
+        # A proxy that forwards the host but not the scheme is the ordinary
+        # case rather than an error, so the scheme falls back on its own instead
+        # of discarding a host that is perfectly usable.
+        proto = request.url.scheme
+
+    host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").strip()
+    forwarded = f"{proto}://{host}" if host else ""
+
+    try:
+        parts = urlsplit(forwarded)
+    except ValueError:
+        # A malformed authority (an unclosed IPv6 bracket, say) is not usable.
+        return str(request.base_url).rstrip("/")
+
+    if (
+        parts.scheme in ("http", "https")
+        and parts.netloc
+        and set(parts.netloc) <= _AUTHORITY_CHARS
+        and not parts.path
+        and not parts.query
+        and not parts.fragment
+    ):
+        return f"{parts.scheme}://{parts.netloc}"
+    return str(request.base_url).rstrip("/")
+
+
+def _media_url(request: Request, path: str) -> str:
+    """The URL a client can fetch one generated file from."""
+    return f"{_base_url(request)}/api/v1/media/{Path(path).name}"
 
 
 def _no_image_detail(result: dict) -> str:
@@ -327,9 +355,10 @@ def _sse(body: dict) -> StreamingResponse:
         200: {
             "content": {
                 "application/json": {},
+                "image/png": {},
                 "image/jpeg": {},
             },
-            "description": "OpenAI 호환 JSON(URL/Base64) 또는 Swagger UI 미리보기용 이미지 파일",
+            "description": "OpenAI-shaped JSON, or the image file itself for inline preview",
         }
     },
 )
@@ -339,21 +368,26 @@ def _sse(body: dict) -> StreamingResponse:
         200: {
             "content": {
                 "application/json": {},
+                "image/png": {},
                 "image/jpeg": {},
             },
-            "description": "OpenAI 호환 JSON(URL/Base64) 또는 Swagger UI 미리보기용 이미지 파일",
+            "description": "OpenAI-shaped JSON, or the image file itself for inline preview",
         }
     },
 )
 async def openai_images(payload: ImageGenerationRequest, request: Request):
-    """OpenAI 규격 이미지 생성 엔드포인트.
+    """Generate an image from an OpenAI images payload.
 
-    - response_format='image' (또는 'file', 'binary', 'preview'):
-      생성된 이미지 파일(image/jpeg)을 직접 스트리밍하여 Swagger UI 및 브라우저에서 즉시 그림으로 확인하고 다운로드할 수 있습니다.
-    - response_format='url' (기본값):
-      OpenAI 표준 형식에 맞추어 외부에서 접속 가능한 다운로드 URL을 포함한 JSON을 반환합니다.
-    - response_format='b64_json':
-      Base64로 인코딩된 이미지 문자열 JSON을 반환합니다.
+    `response_format` decides how the bytes come back:
+
+    - `image` (also `file`, `binary`, `raw`, `preview`): the image file itself,
+      streamed, so Swagger UI or a plain browser can show or save it at once.
+    - `url` (the default): OpenAI's own shape, JSON carrying a download URL a
+      client on another machine can fetch.
+    - `b64_json`: the bytes inlined as a base64 string.
+
+    The declared types list PNG as well as JPEG because the type is resolved per
+    file, and PNG is what the engine writes today.
     """
     aspect = SIZE_TO_ASPECT.get(payload.size.strip().lower())
     if aspect is None:
@@ -383,7 +417,8 @@ async def openai_images(payload: ImageGenerationRequest, request: Request):
 
     fmt = (payload.response_format or "").strip().lower()
 
-    # Swagger UI 미리보기 및 외부 브라우저 직접 다운로드를 위한 이미지 바이너리 즉시 반환
+    # Hand the bytes back untouched: this is the branch a browser and Swagger UI
+    # use to show the image and its download button.
     if fmt in ("image", "file", "binary", "raw", "preview"):
         first_file = files[0].get("path")
         if first_file:
@@ -446,10 +481,11 @@ async def openai_chat(payload: ChatCompletionRequest, request: Request):
 @app.post("/v1/image")
 @app.post("/api/v1/image")
 async def flow_image(payload: FlowImageRequest, request: Request):
-    """Google Flow 고유 매개변수를 사용하는 네이티브 이미지 생성 엔드포인트.
+    """Generate an image, speaking the engine's own vocabulary.
 
-    생성된 파일 목록(files)의 각 항목에 외부 클라이언트가 직접 다운로드할 수 있는
-    완전한 HTTP URL(url)을 자동으로 추가하여 반환합니다.
+    Each entry in `files` is also given a `url` a client can fetch directly, so
+    a caller on a different machine from this process does not have to be told
+    where the file was written.
     """
     try:
         result = await engine.generate_image(
@@ -460,7 +496,7 @@ async def flow_image(payload: FlowImageRequest, request: Request):
             all_accounts=payload.all_accounts,
             cookies=payload.cookies,
         )
-        # 외부 클라이언트가 직접 파일을 내려받을 수 있도록 다운로드 URL 주입
+        # A caller that is not this process needs a URL, not a path.
         if isinstance(result, dict) and "files" in result and isinstance(result["files"], list):
             for f in result["files"]:
                 if isinstance(f, dict) and "path" in f:
@@ -474,7 +510,7 @@ async def flow_image(payload: FlowImageRequest, request: Request):
 @app.post("/v1/video")
 @app.post("/api/v1/video")
 async def flow_video(payload: FlowVideoRequest, request: Request):
-    """비디오 생성 엔드포인트."""
+    """Generate a video, speaking the engine's own vocabulary."""
     try:
         result = await engine.generate_video(
             prompt=payload.prompt,
@@ -537,6 +573,11 @@ async def flow_media(filename: str):
     `engine.root` is read defensively. It is optional on the engine contract,
     and a missing attribute must be a 404 here, not a 500.
 
+    There is deliberately no `__file__`-relative guess at an output directory:
+    the package's install layout has nothing to do with where the engine writes,
+    so such a candidate either duplicates a directory already in the list or
+    serves files from somewhere the engine never put them.
+
     The content type comes from `mimetypes` rather than a hand-kept extension
     table, because the preview page exists to render images inline - serving a
     PNG as `application/octet-stream` makes the browser download it instead.
@@ -545,7 +586,6 @@ async def flow_media(filename: str):
     engine_root = getattr(engine, "root", None)
     if engine_root is not None:
         search_dirs.append(Path(engine_root) / "output")
-    search_dirs.append(Path(__file__).resolve().parent.parent / "output")
 
     for sdir in search_dirs:
         base = Path(sdir).resolve()
@@ -566,15 +606,15 @@ async def health():
 
 
 # --------------------------------------------------------------------------- #
-# Web Preview Dashboard (웹 브라우저 실시간 미리보기 및 다운로드 페이지)
+# web preview dashboard
 # --------------------------------------------------------------------------- #
 
 PREVIEW_HTML = """<!DOCTYPE html>
-<html lang="ko">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Flow Agent - OpenAI 이미지 생성 미리보기</title>
+    <title>Flow Agent - OpenAI image generation preview</title>
     <style>
         :root {
             --bg-primary: #0f172a;
@@ -753,55 +793,55 @@ PREVIEW_HTML = """<!DOCTYPE html>
 <body>
     <div class="container">
         <header>
-            <h1>⚡ Flow Agent <span class="badge">OpenAI DALL-E 호환</span></h1>
-            <p class="subtitle">OpenAI 규격(<code>/v1/images/generations</code>)으로 이미지를 생성하고 즉시 브라우저에서 미리보기 및 다운로드합니다.</p>
+            <h1>⚡ Flow Agent <span class="badge">OpenAI-compatible</span></h1>
+            <p class="subtitle">Generate an image over <code>/v1/images/generations</code>, then preview or download it here.</p>
         </header>
 
         <form id="genForm">
             <div class="form-group">
-                <label for="prompt">프롬프트 (Prompt)</label>
-                <textarea id="prompt" rows="3" required placeholder="예: a serene Japanese zen garden in autumn, cinematic lighting, 8k">a glowing crystal lotus on calm water</textarea>
+                <label for="prompt">Prompt</label>
+                <textarea id="prompt" rows="3" required placeholder="e.g. a serene Japanese zen garden in autumn, cinematic lighting, 8k">a glowing crystal lotus on calm water</textarea>
             </div>
 
             <div class="row">
                 <div class="form-group">
-                    <label for="size">해상도 / 비율</label>
+                    <label for="size">Size / aspect</label>
                     <select id="size">
-                        <option value="1024x1024" selected>1024x1024 (정사각형 1:1)</option>
-                        <option value="1792x1024">1792x1024 (와이드 16:9)</option>
-                        <option value="1024x1792">1024x1792 (세로형 9:16)</option>
-                        <option value="1365x1024">1365x1024 (가로형 4:3)</option>
-                        <option value="1024x1365">1024x1365 (세로형 3:4)</option>
+                        <option value="1024x1024" selected>1024x1024 (square 1:1)</option>
+                        <option value="1792x1024">1792x1024 (wide 16:9)</option>
+                        <option value="1024x1792">1024x1792 (tall 9:16)</option>
+                        <option value="1365x1024">1365x1024 (landscape 4:3)</option>
+                        <option value="1024x1365">1024x1365 (portrait 3:4)</option>
                     </select>
                 </div>
 
                 <div class="form-group">
-                    <label for="format">수신 방식</label>
+                    <label for="format">Receive as</label>
                     <select id="format">
-                        <option value="image" selected>이미지 직접 수신 (즉시 미리보기/다운로드)</option>
-                        <option value="url">OpenAI 표준 JSON (URL 링크)</option>
+                        <option value="image" selected>Image bytes (preview/download at once)</option>
+                        <option value="url">OpenAI JSON (URL link)</option>
                     </select>
                 </div>
             </div>
 
-            <button type="submit" id="btnSubmit" class="btn-generate">🎨 OpenAI 방식으로 이미지 생성하기</button>
+            <button type="submit" id="btnSubmit" class="btn-generate">🎨 Generate image (OpenAI route)</button>
         </form>
 
         <div id="resultSection" class="result-section">
-            <div id="statusBox" class="status-box">생성 중...</div>
+            <div id="statusBox" class="status-box">Generating...</div>
             <div id="imageBox" class="image-container" style="display: none;">
-                <img id="resultImage" src="" alt="생성된 이미지" />
+                <img id="resultImage" src="" alt="Generated image" />
                 <div class="action-bar">
-                    <a id="btnDownload" href="#" download="flow_image.jpg" class="btn-action download">📥 이미지 다운로드</a>
-                    <a id="btnNewTab" href="#" target="_blank" class="btn-action">🔍 새 탭에서 원본 보기</a>
+                    <a id="btnDownload" href="#" download="flow_image.jpg" class="btn-action download">📥 Download image</a>
+                    <a id="btnNewTab" href="#" target="_blank" class="btn-action">🔍 Open the original</a>
                 </div>
             </div>
         </div>
 
         <div class="links">
-            <a href="/docs" target="_blank">📖 Swagger UI API 문서</a> |
+            <a href="/docs" target="_blank">📖 Swagger UI docs</a> |
             <a href="/redoc" target="_blank">📘 ReDoc</a> |
-            <a href="/health" target="_blank">🩺 서버 상태(/health)</a>
+            <a href="/health" target="_blank">🩺 Server health (/health)</a>
         </div>
     </div>
 
@@ -827,18 +867,18 @@ PREVIEW_HTML = """<!DOCTYPE html>
             if (!prompt) return;
 
             btnSubmit.disabled = true;
-            btnSubmit.innerText = '⏳ 이미지 생성 중... 잠시만 기다려 주세요';
+            btnSubmit.innerText = '⏳ Generating... this takes a moment';
             resultSection.style.display = 'block';
             imageBox.style.display = 'none';
 
             let startTime = Date.now();
             statusBox.style.background = 'rgba(59, 130, 246, 0.1)';
             statusBox.style.color = '#60a5fa';
-            statusBox.innerText = `Google Flow 원격 생성 요청 중... (소요 시간: 0초)`;
+            statusBox.innerText = 'Asking Google Flow to generate... (0s elapsed)';
 
             timerId = setInterval(() => {
                 const elapsed = Math.floor((Date.now() - startTime) / 1000);
-                statusBox.innerText = `Google Flow 원격 생성 및 다운로드 중... (소요 시간: ${elapsed}초)`;
+                statusBox.innerText = `Generating on Google Flow and downloading... (${elapsed}s elapsed)`;
             }, 1000);
 
             try {
@@ -863,15 +903,15 @@ PREVIEW_HTML = """<!DOCTYPE html>
                     const errText = await res.text();
                     statusBox.style.background = 'rgba(239, 68, 68, 0.1)';
                     statusBox.style.color = '#f87171';
-                    statusBox.innerText = `[생성 오류 ${res.status}] ${errText}`;
+                    statusBox.innerText = `[generation failed ${res.status}] ${errText}`;
                     btnSubmit.disabled = false;
-                    btnSubmit.innerText = '🎨 OpenAI 방식으로 이미지 생성하기';
+                    btnSubmit.innerText = '🎨 Generate image (OpenAI route)';
                     return;
                 }
 
                 statusBox.style.background = 'rgba(34, 197, 94, 0.1)';
                 statusBox.style.color = '#4ade80';
-                statusBox.innerText = `✓ 생성 성공! (소요 시간: ${elapsedSec}초)`;
+                statusBox.innerText = `✓ Done in ${elapsedSec}s`;
 
                 let imgUrl = '';
                 if (format === 'image') {
@@ -895,10 +935,10 @@ PREVIEW_HTML = """<!DOCTYPE html>
                 clearInterval(timerId);
                 statusBox.style.background = 'rgba(239, 68, 68, 0.1)';
                 statusBox.style.color = '#f87171';
-                statusBox.innerText = `[통신 오류] ${err.message}`;
+                statusBox.innerText = `[request failed] ${err.message}`;
             } finally {
                 btnSubmit.disabled = false;
-                btnSubmit.innerText = '🎨 OpenAI 방식으로 이미지 생성하기';
+                btnSubmit.innerText = '🎨 Generate image (OpenAI route)';
             }
         });
     </script>
@@ -910,5 +950,5 @@ PREVIEW_HTML = """<!DOCTYPE html>
 @app.get("/", response_class=HTMLResponse)
 @app.get("/preview", response_class=HTMLResponse)
 async def preview_dashboard():
-    """브라우저에서 OpenAI API 방식으로 이미지를 즉시 생성하고 확인하는 실시간 미리보기 대시보드."""
+    """Generate over the OpenAI route from a browser and show the result at once."""
     return HTMLResponse(content=PREVIEW_HTML)
