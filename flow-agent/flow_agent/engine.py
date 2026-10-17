@@ -21,13 +21,45 @@ from typing import Any, Optional
 #: minutes, so this is generous by design rather than a hang guard.
 DEFAULT_TIMEOUT = 900
 
+#: The image model to run when a request names none.
+DEFAULT_IMAGE_MODEL = "beluga"
 
-def _is_valid_cookie_arg(val: Optional[str]) -> bool:
-    """Filter out dummy placeholders (e.g. 'string', 'null') and empty values sent by Swagger UI or clients."""
-    if not val:
-        return False
-    clean = str(val).strip()
-    return bool(clean and clean.lower() not in ("string", "null", "none", "undefined", '""', "''"))
+#: Values that mean "the field was left blank" rather than naming a model.
+#: Swagger UI fills an untouched field with the literal text `string`.
+_MODEL_PLACEHOLDERS = frozenset({"", "string", "default", "none", "null", "undefined"})
+
+#: The same for cookies, plus the two spellings of an empty string that arrive
+#: already quoted from a form field or a shell.
+_DUMMY_COOKIES = frozenset({"", "string", "null", "none", "undefined", '""', "''"})
+
+
+def clean_model(value: Any) -> str:
+    """The image model to run for `value`.
+
+    A placeholder is "not given" and becomes the default. A name the caller did
+    supply is passed through untouched: rewriting one - `narwhal` to `beluga`,
+    say - runs something other than what was asked for while reporting success,
+    and `main.py` passes its own `narwhal` default straight through, so the two
+    surfaces would disagree about the same word.
+    """
+    if value is None:
+        return DEFAULT_IMAGE_MODEL
+    name = str(value).strip()
+    return DEFAULT_IMAGE_MODEL if name.lower() in _MODEL_PLACEHOLDERS else name
+
+
+def clean_cookies(value: Optional[str]) -> Optional[str]:
+    """The `--cookies` argument for `value`, or None when there is not one.
+
+    Swagger UI sends the literal text `string` for a field left alone and some
+    clients send `null`. Those would hand the engine a session cookie already
+    known to be wrong, which reads as an auth failure rather than as an option
+    nobody set. What survives is stripped, because it becomes one argv token.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    return None if text.lower() in _DUMMY_COOKIES else text
 
 
 class EngineError(RuntimeError):
@@ -253,18 +285,15 @@ class FlowEngine:
         which happens with `download=False` and on a refusal alike, so a caller
         that needs the bytes should read it and not assume it.
         """
-        # Fallback to BELUGA if empty or set to legacy/unsupported models (e.g. narwhal) or dummy placeholders
-        effective_model = "beluga" if (not model or model.lower() in ("narwhal", "string", "default", "none", "null")) else model
-
         args: list[Any] = ["image", prompt, aspect]
         if count and count > 1:
             args.append(f"x{count}")
-        if effective_model:
-            args += ["--model", effective_model]
+        args += ["--model", clean_model(model)]
         if all_accounts:
             args.append("--all")
-        if _is_valid_cookie_arg(cookies):
-            args += ["--cookies", cookies]
+        cookie_arg = clean_cookies(cookies)
+        if cookie_arg:
+            args += ["--cookies", cookie_arg]
         if not download:
             args.append("--no-download")
 
@@ -296,8 +325,9 @@ class FlowEngine:
             args += ["--start-image", start_image]
         if all_accounts:
             args.append("--all")
-        if _is_valid_cookie_arg(cookies):
-            args += ["--cookies", cookies]
+        cookie_arg = clean_cookies(cookies)
+        if cookie_arg:
+            args += ["--cookies", cookie_arg]
         if not download:
             args.append("--no-download")
 
@@ -319,8 +349,9 @@ class FlowEngine:
         args: list[Any] = ["upload-video", file_path]
         if force:
             args.append("--force-upload")
-        if _is_valid_cookie_arg(cookies):
-            args += ["--cookies", cookies]
+        cookie_arg = clean_cookies(cookies)
+        if cookie_arg:
+            args += ["--cookies", cookie_arg]
 
         return await self._run_json(*args, timeout=timeout)
 
@@ -349,8 +380,9 @@ class FlowEngine:
         not an object wrapping one.
         """
         args: list[Any] = ["projects", "--json"]
-        if _is_valid_cookie_arg(cookies):
-            args += ["--cookies", cookies]
+        cookie_arg = clean_cookies(cookies)
+        if cookie_arg:
+            args += ["--cookies", cookie_arg]
         out, _ = await self._run(*args)
         try:
             parsed = extract_json(out)

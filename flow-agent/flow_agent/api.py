@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .engine import EngineError, FlowEngine
+from .engine import EngineError, FlowEngine, clean_model
 
 app = FastAPI(
     title="flow-agent",
@@ -97,11 +97,8 @@ class ImageGenerationRequest(BaseModel):
     @field_validator("model", mode="before")
     @classmethod
     def sanitize_model(cls, v: Any) -> str:
-        # Fallback to BELUGA if empty or set to legacy/unsupported models or placeholders
-        val = str(v).strip().lower() if v else "beluga"
-        if val in ("narwhal", "string", "default", "none", "null", ""):
-            return "beluga"
-        return val
+        # Swagger UI fills an untouched field with the literal text `string`.
+        return clean_model(v)
 
 
 class FlowImageRequest(BaseModel):
@@ -115,19 +112,8 @@ class FlowImageRequest(BaseModel):
     @field_validator("model", mode="before")
     @classmethod
     def sanitize_model(cls, v: Any) -> str:
-        # Fallback to BELUGA if empty or set to legacy/unsupported models or placeholders
-        val = str(v).strip().lower() if v else "beluga"
-        if val in ("narwhal", "string", "default", "none", "null", ""):
-            return "beluga"
-        return val
-
-    @field_validator("cookies", mode="before")
-    @classmethod
-    def sanitize_cookies(cls, v: Any) -> Optional[str]:
-        # Filter out Swagger UI default placeholder ('string') and empty values
-        if not v or str(v).strip().lower() in ("string", "null", "none", "undefined", '""', "''"):
-            return None
-        return str(v).strip()
+        # Swagger UI fills an untouched field with the literal text `string`.
+        return clean_model(v)
 
 
 class FlowVideoRequest(BaseModel):
@@ -139,14 +125,6 @@ class FlowVideoRequest(BaseModel):
     start_image: Optional[str] = None
     all_accounts: bool = False
     cookies: Optional[str] = None
-
-    @field_validator("cookies", mode="before")
-    @classmethod
-    def sanitize_cookies(cls, v: Any) -> Optional[str]:
-        # Filter out Swagger UI default placeholder ('string') and empty values
-        if not v or str(v).strip().lower() in ("string", "null", "none", "undefined", '""', "''"):
-            return None
-        return str(v).strip()
 
 
 class ChatMessage(BaseModel):

@@ -228,6 +228,24 @@ def test_openai_images_passes_the_count_through(client):
     assert client.fake.calls[-1][1]["count"] == 3
 
 
+def test_openai_images_passes_an_explicit_model_through(client):
+    """A model that was named is the model that runs.
+
+    `narwhal` used to be rewritten to `beluga` without saying so, which is the
+    failure that is hard to notice: the request looks like it did what was
+    asked. The CLI passes its own `narwhal` default straight through, so the
+    two surfaces would also disagree about the same word.
+    """
+    client.post("/v1/images/generations", json={"prompt": "x", "model": "narwhal"})
+    assert client.fake.calls[-1][1]["model"] == "narwhal"
+
+
+def test_openai_images_replaces_a_placeholder_model_with_the_default(client):
+    """Swagger UI sends the literal text `string` for a field left alone."""
+    client.post("/v1/images/generations", json={"prompt": "x", "model": "string"})
+    assert client.fake.calls[-1][1]["model"] == "beluga"
+
+
 def test_openai_images_ignores_fields_it_does_not_model(client):
     """An OpenAI client sends keys this does not know; failing on them would
     make the endpoint unusable from the SDKs it exists to serve."""
