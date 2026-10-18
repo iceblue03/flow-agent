@@ -101,56 +101,62 @@ def cmd_projects(args) -> int:
 
 
 def cmd_key(args) -> int:
-    """API Key 생성, 목록 조회, 비활성화 및 삭제 서브커맨드 처리 핸들러."""
+    """Create, list, revoke or delete the API keys this server accepts."""
     from flow_agent import create_api_key, delete_api_key, list_api_keys, mask_key, revoke_api_key
+    from flow_agent.auth import KEY_PREFIX, KeyStoreError
+
+    def label(target: str) -> str:
+        # Echo a masked form of a key string; never print the secret itself.
+        return mask_key(target) if target.startswith(KEY_PREFIX) else target
 
     action = args.key_action
-    if action == "create":
-        entry = create_api_key(name=args.name)
-        print("=" * 68)
-        print("  🔑 새로운 Google Flow API Key가 성공적으로 생성되었습니다.")
-        print("=" * 68)
-        print(f"  - 별칭 (Name) : {entry['name']}")
-        print(f"  - API Key     : {entry['key']}")
-        print(f"  - 생성 일시   : {entry['created_at']}")
-        print("=" * 68)
-        print("  [주의] 생성된 키는 안전한 장소에 보관하십시오.")
-        print("  OpenAI SDK 사용 예시:")
-        print(f'    client = OpenAI(base_url="http://<호스트>:8001/v1", api_key="{entry["key"]}")')
-        print("=" * 68)
-        return 0
-
-    if action == "list":
-        keys = list_api_keys()
-        if not keys:
-            print("등록된 API Key가 없습니다. 'python main.py key create' 명령으로 새 키를 생성하세요.")
+    try:
+        if action == "create":
+            entry = create_api_key(name=args.name)
+            key_value = entry["key"]
+            print("=" * 68)
+            print("  New Google Flow API key created.")
+            print("=" * 68)
+            print(f"  - Name    : {entry['name']}")
+            print(f"  - API Key : {key_value}")
+            print(f"  - Created : {entry['created_at']}")
+            print("=" * 68)
+            print("  [!] Store this key somewhere safe; it is not shown again.")
+            print("  OpenAI SDK example:")
+            print(f'    client = OpenAI(base_url="http://<host>:8001/v1", api_key="{key_value}")')
+            print("=" * 68)
             return 0
-        print(f"{'상태':<6} | {'별칭 (Name)':<20} | {'API Key':<24} | {'생성 일시'}")
-        print("-" * 75)
-        for k in keys:
-            status_str = "활성" if k.get("active", True) else "비활성"
-            print(
-                f"{status_str:<6} | {k.get('name', 'default'):<20} | "
-                f"{mask_key(k.get('key', '')):<24} | {k.get('created_at', '')}"
-            )
-        return 0
 
-    if action == "revoke":
-        target = args.target
-        success = revoke_api_key(target)
-        if success:
-            print(f"성공: API Key '{target}'가 비활성화되었습니다.")
+        if action == "list":
+            keys = list_api_keys()
+            if not keys:
+                print("No API keys registered. Create one with 'python main.py key create'.")
+                return 0
+            print(f"{'State':<8} | {'Name':<20} | {'API Key':<24} | Created")
+            print("-" * 75)
+            for k in keys:
+                state = "active" if k.get("active", True) else "revoked"
+                print(
+                    f"{state:<8} | {k.get('name', 'default'):<20} | "
+                    f"{mask_key(k.get('key', '')):<24} | {k.get('created_at', '')}"
+                )
             return 0
-        print(f"오류: 대상 API Key 또는 별칭 '{target}'을 찾을 수 없습니다.", file=sys.stderr)
-        return 1
 
-    if action == "delete":
-        target = args.target
-        success = delete_api_key(target)
-        if success:
-            print(f"성공: API Key '{target}'가 영구 삭제되었습니다.")
-            return 0
-        print(f"오류: 대상 API Key 또는 별칭 '{target}'을 찾을 수 없습니다.", file=sys.stderr)
+        if action == "revoke":
+            if revoke_api_key(args.target):
+                print(f"Revoked API key '{label(args.target)}'.")
+                return 0
+            print(f"error: no API key or alias named '{label(args.target)}'", file=sys.stderr)
+            return 1
+
+        if action == "delete":
+            if delete_api_key(args.target):
+                print(f"Deleted API key '{label(args.target)}'.")
+                return 0
+            print(f"error: no API key or alias named '{label(args.target)}'", file=sys.stderr)
+            return 1
+    except (KeyStoreError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
     return 0
