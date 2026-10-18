@@ -309,6 +309,48 @@ def test_openai_images_reports_an_unreadable_file_as_a_failure(client):
     assert response.status_code == 502
 
 
+def test_openai_images_streams_the_file_it_was_asked_for(client):
+    """`response_format: "image"` hands back the bytes, not a description.
+
+    This is the branch Swagger UI's Execute button and the dashboard use, so it
+    has to answer with the file itself and name its real type.
+    """
+    target = client.media_dir / "one.jpg"
+    target.write_bytes(b"\xff\xd8\xff\xe0jpeg-bytes")
+    client.fake.image = {"status": "succeeded", "files": [{"path": str(target)}]}
+
+    response = client.post(
+        "/v1/images/generations",
+        json={"prompt": "x", "response_format": "image"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"\xff\xd8\xff\xe0jpeg-bytes"
+    assert response.headers["content-type"] == "image/jpeg"
+
+
+def test_openai_images_streams_a_png_as_a_png(client):
+    """The streamed type comes from the file, so a PNG is not called a JPEG.
+
+    A label that disagrees with the bytes makes the browser download the file
+    instead of rendering it, which is the outcome the preview branch exists to
+    avoid. PNG is reachable: `response_format: "image"` serves whichever file
+    the engine produced.
+    """
+    target = client.media_dir / "one.png"
+    target.write_bytes(b"\x89PNG\r\n\x1a\npng-bytes")
+    client.fake.image = {"status": "succeeded", "files": [{"path": str(target)}]}
+
+    response = client.post(
+        "/api/v1/images/generations",
+        json={"prompt": "x", "response_format": "image"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"\x89PNG\r\n\x1a\npng-bytes"
+    assert response.headers["content-type"] == "image/png"
+
+
 # --------------------------------------------------------------------------- #
 # OpenAI-compatible chat
 # --------------------------------------------------------------------------- #

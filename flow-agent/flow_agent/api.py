@@ -364,8 +364,9 @@ async def openai_images(payload: ImageGenerationRequest, request: Request):
       client on another machine can fetch.
     - `b64_json`: the bytes inlined as a base64 string.
 
-    The declared types list PNG as well as JPEG because the type is resolved per
-    file, and PNG is what the engine writes today.
+    The declared types list PNG as well as JPEG because the type of a streamed
+    file is read from the file itself, so whichever one the engine wrote is the
+    one the client is told.
     """
     aspect = SIZE_TO_ASPECT.get(payload.size.strip().lower())
     if aspect is None:
@@ -402,9 +403,14 @@ async def openai_images(payload: ImageGenerationRequest, request: Request):
         if first_file:
             img_path = Path(first_file)
             if img_path.is_file():
+                # Read the type off the file, the same rule the media route
+                # above uses. A hardcoded `image/jpeg` mislabels a PNG, and a
+                # client that trusts the label saves the file instead of
+                # showing it - the one thing this branch exists to do.
+                media_type = mimetypes.guess_type(img_path.name)[0] or "application/octet-stream"
                 return FileResponse(
                     img_path,
-                    media_type="image/jpeg",
+                    media_type=media_type,
                     filename=img_path.name,
                 )
 
